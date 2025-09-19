@@ -1,18 +1,16 @@
+// OpenPhone History MCP Server (WebSocket transport)
 import express from "express";
 import { WebSocketServer } from "ws";
 import { request } from "undici";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { WebSocketTransport } from "@modelcontextprotocol/sdk/server/ws.js";
 
 const PORT = process.env.PORT || 3000;
 const API_BASE = "https://api.openphone.com/v1";
 const API_KEY = process.env.OPENPHONE_API_KEY;
 if (!API_KEY) { console.error("Missing OPENPHONE_API_KEY"); process.exit(1); }
 
-const app = express();
-app.get("/", (_req, res) => res.status(200).send("OpenPhone History MCP up"));
-const httpServer = app.listen(PORT, () => console.log("HTTP on :" + PORT));
-
-const wss = new WebSocketServer({ server: httpServer, path: "/mcp" });
-
+// --- plain helper to call OpenPhone REST ---
 async function opGet(path, query) {
   const url = new URL(API_BASE + path);
   for (const [k, v] of Object.entries(query || {})) {
@@ -23,13 +21,35 @@ async function opGet(path, query) {
   return res.body.json();
 }
 
-function toolDefs() {
-  return {
-    "openphone-list-phone-numbers": {
+// --- HTTP server just for healthcheck and WS upgrade target ---
+const app = express();
+app.get("/", (_req, res) => res.status(200).send("OpenPhone History MCP up"));
+const httpServer = app.listen(PORT, () => console.log("HTTP on :" + PORT));
+
+// --- WebSocket endpoint for MCP ---
+const wss = new WebSocketServer({ server: httpServer, path: "/mcp" });
+
+wss.on("connection", (ws) => {
+  // Create one MCP server per connection
+  const mcp = new Server({ name: "openphone-history", version: "1.0.0" });
+
+  // Tool: list numbers
+  mcp.tool(
+    {
+      name: "openphone-list-phone-numbers",
       description: "List OpenPhone numbers in the workspace",
       inputSchema: { type: "object", properties: {} }
     },
-    "openphone-list-messages": {
+    async () => {
+      const data = await opGet("/phone-numbers");
+      return { content: [{ type: "json", data }] };
+    }
+  );
+
+  // Tool: list messages
+  mcp.tool(
+    {
+      name: "openphone-list-messages",
       description: "List messages with a participant for a given phoneNumberId",
       inputSchema: {
         type: "object",
@@ -44,7 +64,16 @@ function toolDefs() {
         required: ["phoneNumberId", "participants"]
       }
     },
-    "openphone-list-calls": {
+    async (args) => {
+      const data = await opGet("/messages", args);
+      return { content: [{ type: "json", data }] };
+    }
+  );
+
+  // Tool: list calls
+  mcp.tool(
+    {
+      name: "openphone-list-calls",
       description: "List calls with a participant for a given phoneNumberId",
       inputSchema: {
         type: "object",
@@ -58,38 +87,14 @@ function toolDefs() {
         },
         required: ["phoneNumberId", "participants"]
       }
+    },
+    async (args) => {
+      const data = await opGet("/calls", args);
+      return { content: [{ type: "json", data }] };
     }
-  };
-}
+  );
 
-wss.on("connection", (socket) => {
-  socket.on("message", async (raw) => {
-    try {
-      const msg = JSON.parse(raw.toString());
-
-      if (msg.type === "tools/list") {
-        const tools = toolDefs();
-        const items = Object.entries(tools).map(([name, def]) => ({ name, ...def }));
-        socket.send(JSON.stringify({ type: "tools/list_result", tools: items }));
-        return;
-      }
-
-      if (msg.type === "tool/call") {
-        const { name, arguments: args, call_id } = msg;
-        let data;
-        if (name === "openphone-list-phone-numbers") data = await opGet("/phone-numbers");
-        else if (name === "openphone-list-messages") data = await opGet("/messages", args);
-        else if (name === "openphone-list-calls") data = await opGet("/calls", args);
-        else throw new Error(`Unknown tool: ${name}`);
-
-        socket.send(JSON.stringify({
-          type: "tool/call_result",
-          call_id,
-          content: [{ type: "json", data }]
-        }));
-      }
-    } catch (e) {
-      socket.send(JSON.stringify({ type: "error", error: String(e?.message || e) }));
-    }
-  });
+  // Bridge this socket to the MCP server
+  const transport = new WebSocketTransport(ws);
+  mcp.connect(transport);
 });
