@@ -1,65 +1,96 @@
-// server.js
 import express from "express";
-import crypto from "crypto";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+
+/**
+ * IMPORTANT
+ * We do not enforce Authorization headers here so Claude can connect.
+ * Keep this service private (random URL) or add a firewall if you need to restrict access.
+ */
 
 const app = express();
 
-// ---- config ----
-const PORT = process.env.PORT || 8080;
-const SHARED = process.env.CLAUDE_SHARED_SECRET || "";
+/** ---- MCP server + tools ---------------------------------------------- */
 
-// Simple auth middleware
-function requireAuth(req, res, next) {
-  const auth = req.get("authorization") || "";
-  const got = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  const ok = SHARED && crypto.timingSafeEqual(Buffer.from(SHARED), Buffer.from(got || ""));
-  if (!ok) {
-    res.set("WWW-Authenticate", 'Bearer realm="mcp", charset="UTF-8"');
-    return res.status(401).json({ error: "unauthorized" });
+// Create an MCP server instance
+const mcp = new Server(
+  {
+    name: "openphone-history-mcp",
+    version: "1.0.0",
+  },
+  {
+    // Capabilities we’ll claim. Expand as you add real tools/resources.
+    capabilities: {
+      tools: {},
+    },
   }
-  return next();
+);
+
+// Example Tool 1: ping
+mcp.tool("ping", "Simple health check", async ({ params }) => {
+  return {
+    content: [{ type: "text", text: `pong${params?.message ? `: ${params.message}` : ""}` }],
+  };
+});
+
+// Example Tool 2: echo
+mcp.tool("echo", "Echo back arbitrary text", async ({ params }) => {
+  const text = typeof params?.text === "string" ? params.text : "";
+  return { content: [{ type: "text", text }] };
+});
+
+/** ---- HTTP transport for Claude Connectors ----------------------------
+
+Claude Connectors uses:
+  1) GET /sse  -> Server-Sent Events; we must emit a single "endpoint" event
+                 containing the absolute URL that Claude should POST messages to.
+  2) POST /messages -> MCP JSON-RPC over HTTP handled by the SDK.
+*/
+
+function absoluteBaseUrl(req) {
+  // Railway / proxies provide these headers
+  const proto = req.headers["x-forwarded-proto"] || req.protocol || "https";
+  const host = req.headers["x-forwarded-host"] || req.headers.host;
+  return `${proto}://${host}`;
 }
 
-// CORS (Claude connects server-to-server, but this doesn’t hurt)
-app.use((req, res, next) => {
-  res.set("Access-Control-Allow-Origin", "*");
-  res.set("Access-Control-Allow-Headers", "Authorization, Content-Type");
-  res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
+// 1) SSE handshake: stream a single `endpoint` event with the absolute /messages URL
+app.get("/sse", (req, res) => {
+  res.status(200);
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache, no-transform");
+  res.setHeader("Connection", "keep-alive");
 
-// Health (Claude pings this)
-app.get("/", requireAuth, (_req, res) => {
-  res.json({
-    ok: true,
-    transport: "mcp-http-sse",
-    implementation: { name: "openphone-history-mcp", version: "0.1.0" }
-  });
-});
+  const base = absoluteBaseUrl(req);
+  const endpointUrl = `${base}/messages`;
 
-// SSE entry (Claude connects here)
-app.get("/sse", requireAuth, (req, res) => {
-  res.set({
-    "Content-Type": "text/event-stream",
-    "Cache-Control": "no-cache, no-transform",
-    Connection: "keep-alive",
-  });
-  const sessionId = crypto.randomUUID();
+  // Claude expects:  event: endpoint\n data: <url>\n\n
   res.write(`event: endpoint\n`);
-  res.write(`data: /messages?sessionId=${sessionId}\n\n`);
-  // keep-alive
-  const ping = setInterval(() => res.write(`:\n\n`), 15000);
-  req.on("close", () => clearInterval(ping));
+  res.write(`data: ${endpointUrl}\n\n`);
+
+  // Keep the connection open (Claude may hold it for a bit)
+  req.on("close", () => {
+    try {
+      res.end();
+    } catch {}
+  });
 });
 
-// Claude will POST/stream here after SSE handshake
-app.use(express.json({ limit: "1mb" }));
-app.post("/messages", requireAuth, (req, res) => {
-  // TODO: your MCP logic (tools, prompts, etc). For now just echo.
-  res.json({ ok: true, received: req.body || {} });
+// 2) HTTP message endpoint – hand off to the SDK’s HTTP handler
+// NOTE: No auth here; Claude does not send Authorization headers.
+app.post("/messages", express.json({ limit: "2mb" }), async (req, res) => {
+  try {
+    await mcp.handleHttp(req, res);
+  } catch (err) {
+    console.error("MCP HTTP handler error:", err);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "internal_error" });
+    }
+  }
 });
 
+/** ---- Start server ---------------------------------------------------- */
+
+const PORT = process.env.PORT ? Number(process.env.PORT) : 8080;
 app.listen(PORT, () => {
   console.log(`Listening on :${PORT}`);
 });
