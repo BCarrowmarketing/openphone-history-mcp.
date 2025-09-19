@@ -985,12 +985,15 @@ app.get("/sse", (req, res) => {
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Headers", "Cache-Control");
 
   // Tell Claude where to POST MCP HTTP messages
   res.write(`event: endpoint\n`);
   res.write(`data: ${baseUrl(req)}/messages\n\n`);
 
-  req.on("close", () => { try { res.end(); } catch {} });
+  // Close the connection after sending the endpoint info
+  res.end();
 });
 
 // Create a simple JSON-RPC handler for MCP messages
