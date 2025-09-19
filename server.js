@@ -1,16 +1,14 @@
-// OpenPhone History MCP Server (WebSocket transport)
+// Minimal MCP server for Claude (no SDK)
+// Tools: openphone-list-phone-numbers, openphone-list-messages, openphone-list-calls
 import express from "express";
 import { WebSocketServer } from "ws";
 import { request } from "undici";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { WebSocketTransport } from "@modelcontextprotocol/sdk/server/ws.js";
 
 const PORT = process.env.PORT || 3000;
 const API_BASE = "https://api.openphone.com/v1";
 const API_KEY = process.env.OPENPHONE_API_KEY;
 if (!API_KEY) { console.error("Missing OPENPHONE_API_KEY"); process.exit(1); }
 
-// --- plain helper to call OpenPhone REST ---
 async function opGet(path, query) {
   const url = new URL(API_BASE + path);
   for (const [k, v] of Object.entries(query || {})) {
@@ -21,80 +19,110 @@ async function opGet(path, query) {
   return res.body.json();
 }
 
-// --- HTTP server just for healthcheck and WS upgrade target ---
+const TOOLS = [
+  {
+    name: "openphone-list-phone-numbers",
+    description: "List OpenPhone numbers in the workspace",
+    inputSchema: { type: "object", properties: {} }
+  },
+  {
+    name: "openphone-list-messages",
+    description: "List messages with a participant for a given phoneNumberId",
+    inputSchema: {
+      type: "object",
+      properties: {
+        phoneNumberId: { type: "string" },
+        participants: { type: "string", description: "E.164, e.g. +12087311250" },
+        maxResults: { type: "number" },
+        createdAfter: { type: "string" },
+        createdBefore: { type: "string" },
+        pageToken: { type: "string" }
+      },
+      required: ["phoneNumberId", "participants"]
+    }
+  },
+  {
+    name: "openphone-list-calls",
+    description: "List calls with a participant for a given phoneNumberId",
+    inputSchema: {
+      type: "object",
+      properties: {
+        phoneNumberId: { type: "string" },
+        participants: { type: "string", description: "E.164, e.g. +12087311250" },
+        maxResults: { type: "number" },
+        createdAfter: { type: "string" },
+        createdBefore: { type: "string" },
+        pageToken: { type: "string" }
+      },
+      required: ["phoneNumberId", "participants"]
+    }
+  }
+];
+
+// HTTP server (healthcheck)
 const app = express();
 app.get("/", (_req, res) => res.status(200).send("OpenPhone History MCP up"));
-const httpServer = app.listen(PORT, () => console.log("HTTP on :" + PORT));
+const http = app.listen(PORT, () => console.log("HTTP on :" + PORT));
 
-// --- WebSocket endpoint for MCP ---
-const wss = new WebSocketServer({ server: httpServer, path: "/mcp" });
+// WebSocket endpoint that speaks enough MCP for Claude
+const wss = new WebSocketServer({ server: http, path: "/mcp" });
 
 wss.on("connection", (ws) => {
-  // Create one MCP server per connection
-  const mcp = new Server({ name: "openphone-history", version: "1.0.0" });
+  ws.on("message", async (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
 
-  // Tool: list numbers
-  mcp.tool(
-    {
-      name: "openphone-list-phone-numbers",
-      description: "List OpenPhone numbers in the workspace",
-      inputSchema: { type: "object", properties: {} }
-    },
-    async () => {
-      const data = await opGet("/phone-numbers");
-      return { content: [{ type: "json", data }] };
-    }
-  );
-
-  // Tool: list messages
-  mcp.tool(
-    {
-      name: "openphone-list-messages",
-      description: "List messages with a participant for a given phoneNumberId",
-      inputSchema: {
-        type: "object",
-        properties: {
-          phoneNumberId: { type: "string" },
-          participants: { type: "string", description: "E.164, e.g. +12087311250" },
-          maxResults: { type: "number" },
-          createdAfter: { type: "string" },
-          createdBefore: { type: "string" },
-          pageToken: { type: "string" }
-        },
-        required: ["phoneNumberId", "participants"]
+    try {
+      // 1) Handshake
+      if (msg.type === "initialize") {
+        ws.send(JSON.stringify({
+          type: "initialized",
+          protocolVersion: "2024-11-05", // plain string ok for Claude
+          capabilities: { tools: {} }     // declare tool capability
+        }));
+        return;
       }
-    },
-    async (args) => {
-      const data = await opGet("/messages", args);
-      return { content: [{ type: "json", data }] };
-    }
-  );
 
-  // Tool: list calls
-  mcp.tool(
-    {
-      name: "openphone-list-calls",
-      description: "List calls with a participant for a given phoneNumberId",
-      inputSchema: {
-        type: "object",
-        properties: {
-          phoneNumberId: { type: "string" },
-          participants: { type: "string", description: "E.164, e.g. +12087311250" },
-          maxResults: { type: "number" },
-          createdAfter: { type: "string" },
-          createdBefore: { type: "string" },
-          pageToken: { type: "string" }
-        },
-        required: ["phoneNumberId", "participants"]
+      // 2) Tool listing
+      if (msg.type === "tools/list") {
+        ws.send(JSON.stringify({
+          type: "tools/list_result",
+          tools: TOOLS
+        }));
+        return;
       }
-    },
-    async (args) => {
-      const data = await opGet("/calls", args);
-      return { content: [{ type: "json", data }] };
-    }
-  );
 
-  // Bridge this socket to the MCP server
-  const transport = new WebSocketTransport(ws);
-  mcp.connect(transport);
+      // 3) Tool calls
+      if (msg.type === "tool/call") {
+        const { name, arguments: args, call_id } = msg;
+        let data;
+        if (name === "openphone-list-phone-numbers") {
+          data = await opGet("/phone-numbers");
+        } else if (name === "openphone-list-messages") {
+          data = await opGet("/messages", args || {});
+        } else if (name === "openphone-list-calls") {
+          data = await opGet("/calls", args || {});
+        } else {
+          throw new Error(`Unknown tool: ${name}`);
+        }
+
+        ws.send(JSON.stringify({
+          type: "tool/call_result",
+          call_id,
+          content: [{ type: "json", data }]
+        }));
+        return;
+      }
+
+      // Optional keepalive
+      if (msg.type === "ping") {
+        ws.send(JSON.stringify({ type: "pong" }));
+        return;
+      }
+    } catch (e) {
+      // MCP error envelope
+      const payload = { type: "error", error: String(e?.message || e) };
+      ws.send(JSON.stringify(payload));
+    }
+  });
 });
