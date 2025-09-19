@@ -1,5 +1,6 @@
 import express from "express";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { 
   ListToolsRequestSchema, 
   CallToolRequestSchema 
@@ -8,13 +9,13 @@ import {
 const app = express();
 
 // Create an MCP server instance with comprehensive OpenPhone tools
-const mcp = new Server(
+const server = new Server(
   { name: "openphone-history-mcp", version: "1.0.0" },
   { capabilities: { tools: {} } }
 );
 
 // Register all OpenPhone API tools
-mcp.setRequestHandler(ListToolsRequestSchema, async () => {
+server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       // CALLS
@@ -535,7 +536,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 // Handle tool calls
-mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   
   // You'll need to set your OpenPhone API key as an environment variable
@@ -992,13 +993,40 @@ app.get("/sse", (req, res) => {
   req.on("close", () => { try { res.end(); } catch {} });
 });
 
-// MCP HTTP transport: Claude will POST here
+// Create a simple JSON-RPC handler for MCP messages
 app.post("/messages", express.json({ limit: "2mb" }), async (req, res) => {
   try {
-    await mcp.handleHttp(req, res);
+    const request = req.body;
+    
+    // Handle JSON-RPC format
+    if (request.method === "tools/list") {
+      const handler = server.getRequestHandler(ListToolsRequestSchema);
+      const response = await handler(request);
+      res.json({
+        id: request.id,
+        result: response
+      });
+    } else if (request.method === "tools/call") {
+      const handler = server.getRequestHandler(CallToolRequestSchema);
+      const response = await handler(request);
+      res.json({
+        id: request.id,
+        result: response
+      });
+    } else {
+      res.json({
+        id: request.id,
+        error: { code: -32601, message: "Method not found" }
+      });
+    }
   } catch (err) {
     console.error("MCP HTTP error:", err);
-    if (!res.headersSent) res.status(500).json({ error: "internal_error" });
+    if (!res.headersSent) {
+      res.json({
+        id: req.body?.id || null,
+        error: { code: -32603, message: "Internal error" }
+      });
+    }
   }
 });
 
