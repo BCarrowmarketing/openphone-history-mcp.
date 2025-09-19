@@ -1,67 +1,65 @@
+// server.js
 import express from "express";
-import { randomUUID } from "crypto";
-import cors from "cors";
+import crypto from "crypto";
 
 const app = express();
-app.use(cors());
-app.use(express.json());
 
-// Optional shared secret (set in Railway if you want to enforce it)
+// ---- config ----
+const PORT = process.env.PORT || 8080;
 const SHARED = process.env.CLAUDE_SHARED_SECRET || "";
 
-// Middleware: accept/optionally check Bearer token, but never fail hard
-app.use((req, res, next) => {
+// Simple auth middleware
+function requireAuth(req, res, next) {
   const auth = req.get("authorization") || "";
-  // If you configured a secret, enforce it
-  if (SHARED) {
-    const ok = auth.startsWith("Bearer ") && auth.slice(7) === SHARED;
-    if (!ok) return res.status(401).json({ error: "unauthorized" });
+  const got = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  const ok = SHARED && crypto.timingSafeEqual(Buffer.from(SHARED), Buffer.from(got || ""));
+  if (!ok) {
+    res.set("WWW-Authenticate", 'Bearer realm="mcp", charset="UTF-8"');
+    return res.status(401).json({ error: "unauthorized" });
   }
-  // If no secret configured, accept any/no token
+  return next();
+}
+
+// CORS (Claude connects server-to-server, but this doesn’t hurt)
+app.use((req, res, next) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Headers", "Authorization, Content-Type");
+  res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
 });
 
-// Health route Claude pings during “Connect”
-app.get("/", (_req, res) => res.status(200).json({ ok: true, transport: "mcp-http-sse" }));
-app.get("/healthz", (_req, res) => res.status(200).send("ok"));
+// Health (Claude pings this)
+app.get("/", requireAuth, (_req, res) => {
+  res.json({
+    ok: true,
+    transport: "mcp-http-sse",
+    implementation: { name: "openphone-history-mcp", version: "0.1.0" }
+  });
+});
 
-// --- SSE session registry (very simple) ---
-const sessions = new Map(); // sessionId -> { res }
-
-app.get("/sse", (req, res) => {
-  // SSE headers
+// SSE entry (Claude connects here)
+app.get("/sse", requireAuth, (req, res) => {
   res.set({
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache, no-transform",
     Connection: "keep-alive",
   });
-  res.flushHeaders();
-
-  const sessionId = randomUUID();
-  sessions.set(sessionId, { res });
-
-  // tell client where to POST messages
+  const sessionId = crypto.randomUUID();
   res.write(`event: endpoint\n`);
   res.write(`data: /messages?sessionId=${sessionId}\n\n`);
-
-  req.on("close", () => {
-    sessions.delete(sessionId);
-  });
+  // keep-alive
+  const ping = setInterval(() => res.write(`:\n\n`), 15000);
+  req.on("close", () => clearInterval(ping));
 });
 
-// Claude will POST tool calls here
-app.post("/messages", (req, res) => {
-  const { sessionId } = req.query;
-  if (!sessionId || !sessions.has(sessionId)) {
-    return res.status(400).json({ error: "invalid session" });
-  }
-
-  // Handle MCP JSON-RPC payload from Claude here.
-  // For now, echo a minimal success to prove auth/transport:
-  res.json({ ok: true });
+// Claude will POST/stream here after SSE handshake
+app.use(express.json({ limit: "1mb" }));
+app.post("/messages", requireAuth, (req, res) => {
+  // TODO: your MCP logic (tools, prompts, etc). For now just echo.
+  res.json({ ok: true, received: req.body || {} });
 });
 
-const port = process.env.PORT || 8080;
-app.listen(port, () => {
-  console.log(`Listening on :${port}`);
+app.listen(PORT, () => {
+  console.log(`Listening on :${PORT}`);
 });
