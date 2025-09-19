@@ -1,134 +1,71 @@
-// OpenPhone History MCP Server (SDK-based) — works with Claude
 import express from "express";
-import { WebSocketServer } from "ws";
-import { request } from "undici";
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { WebSocketTransport } from "@modelcontextprotocol/sdk/server/ws.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { z } from "zod";
 
-const PORT = process.env.PORT || 3000;
-const API_BASE = "https://api.openphone.com/v1";
-const API_KEY = process.env.OPENPHONE_API_KEY;
-if (!API_KEY) {
-  console.error("Missing OPENPHONE_API_KEY");
-  process.exit(1);
-}
-
-// --- Helpers to call OpenPhone REST ---
-async function opGet(path, query) {
-  const url = new URL(API_BASE + path);
-  for (const [k, v] of Object.entries(query || {})) {
-    if (v !== undefined && v !== null && v !== "") url.searchParams.set(k, String(v));
-  }
-  const res = await request(url, {
-    method: "GET",
-    headers: { Authorization: `Bearer ${API_KEY}` }
-  });
-  if (res.statusCode >= 400) throw new Error(`OpenPhone ${res.statusCode}: ${await res.body.text()}`);
-  return res.body.json();
-}
-
-// (Optional) POST for send-message if you want it later
-async function opPost(path, body) {
-  const res = await request(API_BASE + path, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${API_KEY}`,
-      "content-type": "application/json"
-    },
-    body: JSON.stringify(body)
-  });
-  if (res.statusCode >= 400) throw new Error(`OpenPhone ${res.statusCode}: ${await res.body.text()}`);
-  return res.body.json();
-}
-
-// --- Healthcheck HTTP ---
 const app = express();
-app.get("/", (_req, res) => res.status(200).send("OpenPhone History MCP up"));
-const httpServer = app.listen(PORT, () => console.log("HTTP on :" + PORT));
+app.use(express.json());
 
-// --- WebSocket endpoint that speaks MCP (accept the 'mcp' subprotocol) ---
-const wss = new WebSocketServer({
-  server: httpServer,
-  path: "/mcp",
-  handleProtocols: (protocols) => (protocols.includes("mcp") ? "mcp" : false)
+// 1) Create the MCP server
+const server = new McpServer({
+  name: "openphone-bridge",
+  version: "1.0.0",
 });
 
-// One MCP server per WS connection
-wss.on("connection", (ws) => {
-  const mcp = new Server({ name: "openphone-history", version: "1.0.0" });
+// 2) (Optional) Example tool to prove it works
+server.tool(
+  "echo",
+  { text: z.string() },
+  async ({ text }) => ({ content: [{ type: "text", text }] })
+);
 
-  // Tool: list numbers
-  mcp.tool(
-    {
-      name: "openphone-list-phone-numbers",
-      description: "List OpenPhone numbers in the workspace",
-      inputSchema: { type: "object", properties: {} }
-    },
-    async () => ({ content: [{ type: "json", data: await opGet("/phone-numbers") }] })
-  );
+// 3) (Optional) Example resource
+server.resource(
+  "hello",
+  new ResourceTemplate("hello://{name}", { list: undefined }),
+  async (uri, { name }) => ({
+    contents: [{ uri: uri.href, text: `Hello, ${name}!` }]
+  })
+);
 
-  // Tool: list messages
-  mcp.tool(
-    {
-      name: "openphone-list-messages",
-      description: "List messages with a participant for a given phoneNumberId",
-      inputSchema: {
-        type: "object",
-        properties: {
-          phoneNumberId: { type: "string" },
-          participants: { type: "string", description: "E.164, e.g. +12087311250" },
-          maxResults: { type: "number" },
-          createdAfter: { type: "string" },
-          createdBefore: { type: "string" },
-          pageToken: { type: "string" }
-        },
-        required: ["phoneNumberId", "participants"]
-      }
-    },
-    async (args) => ({ content: [{ type: "json", data: await opGet("/messages", args) }] })
-  );
+// Keep track of transports by session
+const transports = new Map();
 
-  // Tool: list calls
-  mcp.tool(
-    {
-      name: "openphone-list-calls",
-      description: "List calls with a participant for a given phoneNumberId",
-      inputSchema: {
-        type: "object",
-        properties: {
-          phoneNumberId: { type: "string" },
-          participants: { type: "string", description: "E.164, e.g. +12087311250" },
-          maxResults: { type: "number" },
-          createdAfter: { type: "string" },
-          createdBefore: { type: "string" },
-          pageToken: { type: "string" }
-        },
-        required: ["phoneNumberId", "participants"]
-      }
-    },
-    async (args) => ({ content: [{ type: "json", data: await opGet("/calls", args) }] })
-  );
+/**
+ * SSE endpoint that Claude connects to.
+ * Claude opens this first; we hand it an SSE stream and give it a URL
+ * to POST messages back to (/messages?sessionId=...).
+ */
+app.get("/sse", async (req, res) => {
+  const transport = new SSEServerTransport("/messages", res);
+  const id = transport.sessionId;
 
-  // (Optional) Tool: send message — uncomment if you want sending too
-  // mcp.tool(
-  //   {
-  //     name: "openphone-send-message",
-  //     description: "Send an SMS/MMS from a specific phoneNumberId",
-  //     inputSchema: {
-  //       type: "object",
-  //       properties: {
-  //         phoneNumberId: { type: "string" },
- //         to: { type: "string", description: "E.164" },
-  //         text: { type: "string" }
-  //       },
-  //       required: ["phoneNumberId", "to", "text"]
-  //     }
-  //   },
-  //   async ({ phoneNumberId, to, text }) => ({
-  //     content: [{ type: "json", data: await opPost("/messages", { phoneNumberId, to, text }) }]
-  //   })
-  // );
+  transport.onclose = () => {
+    transports.delete(id);
+    console.log(`SSE closed: ${id}`);
+  };
 
-  const transport = new WebSocketTransport(ws);
-  mcp.connect(transport);
+  transports.set(id, transport);
+  console.log(`SSE open: ${id}`);
+  await server.connect(transport);
 });
+
+/**
+ * Messages endpoint: Claude POSTs its protocol messages here,
+ * we route them to the correct transport by sessionId.
+ */
+app.post("/messages", async (req, res) => {
+  const id = req.query.sessionId;
+  if (!id) return res.status(400).json({ error: "Missing sessionId" });
+
+  const transport = transports.get(id);
+  if (!transport) return res.status(404).json({ error: "Unknown sessionId" });
+
+  await transport.handlePostMessage(req, res);
+});
+
+// Healthcheck for Railway
+app.get("/", (_req, res) => res.send("MCP server is running."));
+
+const port = process.env.PORT || 3000;
+app.listen(port, () => console.log(`Listening on :${port}`));
