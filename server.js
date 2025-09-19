@@ -1,5 +1,9 @@
 import express from "express";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { 
+  ListToolsRequestSchema, 
+  CallToolRequestSchema 
+} from "@modelcontextprotocol/sdk/types.js";
 
 const app = express();
 
@@ -10,7 +14,7 @@ const mcp = new Server(
 );
 
 // Register all OpenPhone API tools
-mcp.setRequestHandler({ method: "tools/list" }, async () => {
+mcp.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       // CALLS
@@ -531,7 +535,7 @@ mcp.setRequestHandler({ method: "tools/list" }, async () => {
 });
 
 // Handle tool calls
-mcp.setRequestHandler({ method: "tools/call" }, async (request) => {
+mcp.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
   
   // You'll need to set your OpenPhone API key as an environment variable
