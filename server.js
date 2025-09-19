@@ -10,7 +10,7 @@ const mcp = new Server(
 );
 
 // Register all OpenPhone API tools
-mcp.setRequestHandler("tools/list", async () => {
+mcp.setRequestHandler({ method: "tools/list" }, async () => {
   return {
     tools: [
       // CALLS
@@ -531,7 +531,7 @@ mcp.setRequestHandler("tools/list", async () => {
 });
 
 // Handle tool calls
-mcp.setRequestHandler("tools/call", async (request) => {
+mcp.setRequestHandler({ method: "tools/call" }, async (request) => {
   const { name, arguments: args } = request.params;
   
   // You'll need to set your OpenPhone API key as an environment variable
