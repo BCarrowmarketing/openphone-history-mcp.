@@ -1000,24 +1000,49 @@ app.get("/sse", (req, res) => {
 app.post("/messages", express.json({ limit: "2mb" }), async (req, res) => {
   try {
     const request = req.body;
+    console.log("Received MCP request:", JSON.stringify(request, null, 2));
     
     // Handle JSON-RPC format
     if (request.method === "tools/list") {
-      const handler = server.getRequestHandler(ListToolsRequestSchema);
-      const response = await handler(request);
-      res.json({
-        id: request.id,
-        result: response
-      });
+      try {
+        const handler = server.getRequestHandler(ListToolsRequestSchema);
+        const response = await handler(request);
+        console.log("Tools list response:", JSON.stringify(response, null, 2));
+        res.json({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: response
+        });
+      } catch (handlerError) {
+        console.error("Handler error for tools/list:", handlerError);
+        res.json({
+          jsonrpc: "2.0",
+          id: request.id,
+          error: { code: -32603, message: "Internal error in tools/list" }
+        });
+      }
     } else if (request.method === "tools/call") {
-      const handler = server.getRequestHandler(CallToolRequestSchema);
-      const response = await handler(request);
-      res.json({
-        id: request.id,
-        result: response
-      });
+      try {
+        const handler = server.getRequestHandler(CallToolRequestSchema);
+        const response = await handler(request);
+        console.log("Tool call response:", JSON.stringify(response, null, 2));
+        res.json({
+          jsonrpc: "2.0",
+          id: request.id,
+          result: response
+        });
+      } catch (handlerError) {
+        console.error("Handler error for tools/call:", handlerError);
+        res.json({
+          jsonrpc: "2.0",
+          id: request.id,
+          error: { code: -32603, message: "Internal error in tools/call" }
+        });
+      }
     } else {
+      console.log("Unknown method:", request.method);
       res.json({
+        jsonrpc: "2.0",
         id: request.id,
         error: { code: -32601, message: "Method not found" }
       });
@@ -1026,6 +1051,7 @@ app.post("/messages", express.json({ limit: "2mb" }), async (req, res) => {
     console.error("MCP HTTP error:", err);
     if (!res.headersSent) {
       res.json({
+        jsonrpc: "2.0",
         id: req.body?.id || null,
         error: { code: -32603, message: "Internal error" }
       });
