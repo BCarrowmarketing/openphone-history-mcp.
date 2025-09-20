@@ -213,7 +213,7 @@ app.post("/messages", express.json({ limit: "2mb" }), async (req, res) => {
       case "initialize":
         console.log("Initialize request received");
         result = {
-          protocolVersion: "2024-11-05",
+          protocolVersion: "2025-06-18",
           capabilities: { 
             tools: {},
             logging: {}
