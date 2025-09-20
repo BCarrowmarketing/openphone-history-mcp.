@@ -1,16 +1,16 @@
-# openphone-history-mcp
+# OpenPhone MCP (ChatGPT custom tool server)
 
-Minimal MCP server for Claude Connectors.
+### Env vars (Railway → Variables)
+- `OPENPHONE_API_KEY` – your OpenPhone API key
+- `MCP_SHARED_SECRET` – any long random string
+- `OPENPHONE_BASE_URL` – optional (defaults to `https://api.openphone.com/v1`)
+- `PORT` – defaults to 8080
 
-## Endpoints
-- `GET /sse` streams a single `endpoint` event with the public `/messages` URL
-- `POST /messages` is handled by `@modelcontextprotocol/sdk` (HTTP transport)
+### Endpoints for MCP client
+- SSE stream: `https://<railway-app>.up.railway.app/sse`
+- Root: `https://<railway-app>.up.railway.app/`
 
-## Railway
-- Expose your service publicly on **port 8080**
-- Your public URL should look like: `https://<service>.up.railway.app`
-- In Claude → **Add custom connector**:
-  - Name: `openphone-history-mcp`
-  - Remote MCP server URL: `https://<service>.up.railway.app/sse`
-  - Leave OAuth Client ID/Secret **blank**
-  - Click **Add** and then **Connect**
+### Local quick test
+```bash
+curl -i -H "Authorization: Bearer $MCP_SHARED_SECRET" https://<railway-app>.up.railway.app/
+curl -i -N -H "Authorization: Bearer $MCP_SHARED_SECRET" https://<railway-app>.up.railway.app/sse
