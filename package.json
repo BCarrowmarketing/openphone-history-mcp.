@@ -1,18 +1,15 @@
 {
   "name": "openphone-history-mcp",
-  "version": "0.1.0",
-  "private": true,
+  "version": "0.2.0",
   "type": "module",
-  "engines": {
-    "node": ">=18"
-  },
+  "private": true,
+  "main": "server.js",
+  "license": "MIT",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.10.2",
-    "express": "^4.19.2",
-    "zod": "^3.23.8",
-    "node-fetch": "^3.3.2"
+    "@modelcontextprotocol/sdk": "^0.6.0",
+    "zod": "^3.23.8"
   }
 }
