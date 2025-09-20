@@ -161,16 +161,33 @@ function baseUrl(req) {
   return `${proto}://${host}`;
 }
 
+// Enable CORS for all routes
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 // SSE endpoint for Claude handshake
 app.get("/sse", (req, res) => {
+  console.log("SSE endpoint hit");
+  
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache, no-transform");
   res.setHeader("Connection", "keep-alive");
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Cache-Control");
 
+  const endpoint = `${baseUrl(req)}/messages`;
+  console.log("Sending endpoint:", endpoint);
+  
   res.write(`event: endpoint\n`);
-  res.write(`data: ${baseUrl(req)}/messages\n\n`);
+  res.write(`data: ${endpoint}\n\n`);
   res.end();
 });
 
@@ -178,35 +195,62 @@ app.get("/sse", (req, res) => {
 app.post("/messages", express.json({ limit: "2mb" }), async (req, res) => {
   try {
     const request = req.body;
-    console.log("MCP Request:", request.method, request.id);
+    console.log("MCP Request:", JSON.stringify(request, null, 2));
+
+    // Ensure we have proper request structure
+    if (!request || !request.method) {
+      console.error("Invalid request structure:", request);
+      return res.status(400).json({
+        jsonrpc: "2.0",
+        id: request?.id || null,
+        error: { code: -32600, message: "Invalid Request" }
+      });
+    }
 
     let result;
 
     switch (request.method) {
       case "initialize":
+        console.log("Initialize request received");
         result = {
           protocolVersion: "2024-11-05",
-          capabilities: { tools: {} },
-          serverInfo: { name: "openphone-mcp", version: "1.0.0" }
+          capabilities: { 
+            tools: {},
+            logging: {}
+          },
+          serverInfo: { 
+            name: "openphone-mcp", 
+            version: "1.0.0" 
+          }
         };
         break;
 
       case "initialized":
+        console.log("Initialized notification received");
         result = {};
         break;
 
       case "tools/list":
+        console.log("Tools list request received");
         result = { tools: OPENPHONE_TOOLS };
         break;
 
       case "tools/call":
+        console.log("Tool call request received:", request.params);
         try {
+          if (!request.params || !request.params.name) {
+            throw new Error("Tool name is required");
+          }
+          
           const { name, arguments: args } = request.params;
+          console.log(`Calling tool: ${name} with args:`, args);
+          
           const apiResult = await callOpenPhoneAPI(name, args || {});
           result = {
             content: [{ type: "text", text: apiResult }]
           };
         } catch (error) {
+          console.error("Tool call error:", error);
           result = {
             content: [{ type: "text", text: `Error: ${error.message}` }],
             isError: true
@@ -215,25 +259,29 @@ app.post("/messages", express.json({ limit: "2mb" }), async (req, res) => {
         break;
 
       default:
-        return res.json({
+        console.error("Unknown method:", request.method);
+        return res.status(404).json({
           jsonrpc: "2.0",
           id: request.id,
           error: { code: -32601, message: "Method not found" }
         });
     }
 
-    res.json({
+    const response = {
       jsonrpc: "2.0",
       id: request.id,
       result: result
-    });
+    };
+    
+    console.log("Sending response:", JSON.stringify(response, null, 2));
+    res.json(response);
 
   } catch (error) {
     console.error("MCP Error:", error);
-    res.json({
+    res.status(500).json({
       jsonrpc: "2.0", 
       id: request.body?.id || null,
-      error: { code: -32603, message: "Internal error" }
+      error: { code: -32603, message: "Internal error", data: error.message }
     });
   }
 });
@@ -242,4 +290,8 @@ app.post("/messages", express.json({ limit: "2mb" }), async (req, res) => {
 app.get("/healthz", (_req, res) => res.json({ ok: true }));
 
 const PORT = Number(process.env.PORT || 8080);
-app.listen(PORT, () => console.log(`OpenPhone MCP Server listening on :${PORT}`));
+app.listen(PORT, () => {
+  console.log(`OpenPhone MCP Server listening on :${PORT}`);
+  console.log(`SSE endpoint: http://localhost:${PORT}/sse`);
+  console.log(`Messages endpoint: http://localhost:${PORT}/messages`);
+});
