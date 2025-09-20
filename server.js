@@ -1003,7 +1003,25 @@ app.post("/messages", express.json({ limit: "2mb" }), async (req, res) => {
     console.log("Received MCP request:", JSON.stringify(request, null, 2));
     
     // Handle JSON-RPC format
-    if (request.method === "tools/list") {
+    if (request.method === "initialize") {
+      // MCP initialization handshake
+      const initResponse = {
+        protocolVersion: "2025-06-18",
+        capabilities: {
+          tools: {}
+        },
+        serverInfo: {
+          name: "openphone-history-mcp",
+          version: "1.0.0"
+        }
+      };
+      console.log("Initialize response:", JSON.stringify(initResponse, null, 2));
+      res.json({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: initResponse
+      });
+    } else if (request.method === "tools/list") {
       try {
         const handler = server.getRequestHandler(ListToolsRequestSchema);
         const response = await handler(request);
