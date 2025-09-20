@@ -1,35 +1,119 @@
-import express from "express";
-import { randomUUID } from "crypto";
+// server.js
+// MCP server for OpenPhone with duplicate-registration guard.
+// Works on Node 18+ (fetch is built-in). ESM module (type: module).
+
+import { McpServer, StdioServerTransport } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import fetch from "node-fetch";
 
-// ✅ Correct SDK entry points
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+// ---------- Config ----------
+const OPENPHONE_BASE_URL = process.env.OPENPHONE_BASE_URL?.trim() || "https://api.openphone.com";
+const OPENPHONE_API_KEY = process.env.OPENPHONE_API_KEY?.trim() || "";
 
-// --- Config ---
-const PORT = process.env.PORT || 8080;
-const OPENPHONE_API_KEY = process.env.OPENPHONE_API_KEY || ""; // optional for now
+// ---------- Helpers ----------
 
-// --- Create MCP server ---
-const server = new McpServer(
-  {
-    name: "openphone-history-mcp",
-    version: "0.1.0"
-  },
-  {
-    // You can add model/data resources later if desired
+// Deduplicate tool registration across module reloads/imports
+const _registered = new Set();
+function registerToolSafe(server, def, handler) {
+  const name = def?.name;
+  if (!name || typeof name !== "string") {
+    throw new Error("Tool definition requires a unique string `name`.");
   }
+  if (_registered.has(name)) {
+    console.warn(`Skipping duplicate tool registration: ${name}`);
+    return;
+  }
+  server.registerTool(def, handler);
+  _registered.add(name);
+}
+
+// Simple fetch wrapper with nicer errors + optional retries
+async function http(method, path, { query, body, headers } = {}) {
+  const url = new URL(path.startsWith("http") ? path : `${OPENPHONE_BASE_URL}${path}`);
+  if (query && typeof query === "object") {
+    for (const [k, v] of Object.entries(query)) {
+      if (v === undefined || v === null) continue;
+      if (Array.isArray(v)) v.forEach(val => url.searchParams.append(k, String(val)));
+      else url.searchParams.set(k, String(v));
+    }
+  }
+
+  const h = {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+    ...(headers || {})
+  };
+
+  if (OPENPHONE_API_KEY) {
+    h.Authorization = `Bearer ${OPENPHONE_API_KEY}`;
+  }
+
+  const res = await fetch(url, {
+    method,
+    headers: h,
+    body: body ? JSON.stringify(body) : undefined
+  });
+
+  const text = await res.text();
+  let data;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    data = { raw: text };
+  }
+
+  if (!res.ok) {
+    const msg = data?.message || data?.error || res.statusText || "Request failed";
+    const errorPayload = {
+      status: res.status,
+      statusText: res.statusText,
+      url: url.toString(),
+      message: msg,
+      body: data
+    };
+    const e = new Error(`HTTP ${res.status} ${res.statusText}: ${msg}`);
+    e.details = errorPayload;
+    throw e;
+  }
+
+  // Return both JSON and some headers you may care about (rate limits, etc.)
+  return {
+    data,
+    meta: {
+      url: url.toString(),
+      status: res.status,
+      rateLimitLimit: res.headers.get("x-ratelimit-limit"),
+      rateLimitRemaining: res.headers.get("x-ratelimit-remaining"),
+      rateLimitReset: res.headers.get("x-ratelimit-reset"),
+      requestId: res.headers.get("x-request-id")
+    }
+  };
+}
+
+function requireKey() {
+  if (!OPENPHONE_API_KEY) {
+    const e = new Error("Missing OPENPHONE_API_KEY. Set it in your Railway / environment variables.");
+    e.code = "NO_KEY";
+    throw e;
+  }
+}
+
+// ---------- Server ----------
+const server = new McpServer(
+  { name: "openphone-history-mcp", version: "0.2.0" },
+  {}
 );
 
-// Simple health check tool so you can verify ChatGPT↔️server end-to-end
-server.registerTool(
+// ---------- Tools ----------
+
+// 1) Health check
+registerToolSafe(
+  server,
   {
     name: "ping",
-    description: "Simple health check",
-    inputSchema: z
-      .object({ text: z.string().default("pong") })
-      .default({ text: "pong" })
+    description: "Simple health check. Echoes back your text.",
+    inputSchema: z.object({
+      text: z.string().default("pong")
+    }).default({ text: "pong" })
   },
   async ({ input }) => {
     return {
@@ -38,112 +122,162 @@ server.registerTool(
   }
 );
 
-// (Optional) Example OpenPhone search tool — will no-op if no API key set
-server.registerTool(
+// 2) OpenPhone: search messages (generic text search)
+registerToolSafe(
+  server,
   {
     name: "openphone.searchMessages",
-    description:
-      "Search OpenPhone messages by query string (requires OPENPHONE_API_KEY).",
+    description: "Search OpenPhone messages by a free-text query.",
     inputSchema: z.object({
-      query: z.string().min(1, "Provide a search query"),
-      limit: z.number().int().min(1).max(100).default(20)
+      query: z.string().min(1, "Enter a search query"),
+      limit: z.number().int().min(1).max(100).default(25),
+      cursor: z.string().optional()
     })
   },
   async ({ input }) => {
-    if (!OPENPHONE_API_KEY) {
-      return {
-        isError: true,
-        content: [
-          {
-            type: "text",
-            text:
-              "OPENPHONE_API_KEY is not set in the server environment. Add it in Railway first."
-          }
-        ]
-      };
-    }
-
-    // TODO: Replace with the exact OpenPhone endpoint & params you want.
-    // The path below is a placeholder; consult OpenPhone docs and swap it.
-    const url = new URL("https://api.openphone.com/v1/messages");
-    url.searchParams.set("q", input.query);
-    url.searchParams.set("limit", String(input.limit));
-
-    const r = await fetch(url.toString(), {
-      headers: { Authorization: `Bearer ${OPENPHONE_API_KEY}` }
+    requireKey();
+    // NOTE: Path may differ depending on OpenPhone API; adjust if needed.
+    const path = "/v1/messages/search";
+    const { data, meta } = await http("GET", path, {
+      query: { q: input.query, limit: input.limit, cursor: input.cursor }
     });
-
-    if (!r.ok) {
-      const body = await r.text();
-      return {
-        isError: true,
-        content: [
-          {
-            type: "text",
-            text: `OpenPhone API error ${r.status}: ${body.slice(0, 500)}`
-          }
-        ]
-      };
-    }
-
-    const data = await r.json();
     return {
       content: [
-        {
-          type: "text",
-          text: JSON.stringify(data, null, 2)
-        }
+        { type: "text", text: JSON.stringify({ meta, data }, null, 2) }
       ]
     };
   }
 );
 
-// --- SSE transport wiring (works with ChatGPT & Claude MCP) ---
-const app = express();
-app.use(express.json());
-
-// Keep active transports by sessionId (so reconnects work)
-const transports = new Map();
-
-/**
- * 1) Client opens GET /sse  → we create an SSE transport and emit
- *    `event: endpoint\ndata: /messages?sessionId=...`
- * 2) Client then POSTs to /messages?sessionId=... to send MCP messages
- */
-
-// Establish SSE connection and announce the messages endpoint
-app.get("/sse", async (req, res) => {
-  const sessionId = req.query.sessionId?.toString() || randomUUID();
-
-  // Create a fresh transport for this session
-  const transport = new SSEServerTransport("/messages", res);
-  transports.set(sessionId, transport);
-
-  // Start the MCP session over this transport
-  // (no need to await; it runs with the connection)
-  server.connect(transport);
-
-  // Tell the client which messages endpoint to use
-  res.write(`event: endpoint\n`);
-  res.write(`data: /messages?sessionId=${sessionId}\n\n`);
-  // Keep the stream open; SSEServerTransport will manage heartbeats, etc.
-});
-
-// Receive MCP messages for a given session
-app.post("/messages", async (req, res) => {
-  const sessionId = req.query.sessionId?.toString();
-  if (!sessionId) {
-    return res.status(400).json({ error: "Missing sessionId" });
+// 3) OpenPhone: get a specific message by ID
+registerToolSafe(
+  server,
+  {
+    name: "openphone.getMessage",
+    description: "Get a specific OpenPhone message by ID.",
+    inputSchema: z.object({
+      messageId: z.string().min(1)
+    })
+  },
+  async ({ input }) => {
+    requireKey();
+    const path = `/v1/messages/${encodeURIComponent(input.messageId)}`;
+    const { data, meta } = await http("GET", path);
+    return { content: [{ type: "text", text: JSON.stringify({ meta, data }, null, 2) }] };
   }
-  const transport = transports.get(sessionId);
-  if (!transport) {
-    return res.status(404).json({ error: "Unknown sessionId" });
+);
+
+// 4) OpenPhone: list conversations
+registerToolSafe(
+  server,
+  {
+    name: "openphone.listConversations",
+    description: "List conversations (threads) in OpenPhone.",
+    inputSchema: z.object({
+      limit: z.number().int().min(1).max(100).default(25),
+      cursor: z.string().optional()
+    })
+  },
+  async ({ input }) => {
+    requireKey();
+    const path = "/v1/conversations";
+    const { data, meta } = await http("GET", path, {
+      query: { limit: input.limit, cursor: input.cursor }
+    });
+    return { content: [{ type: "text", text: JSON.stringify({ meta, data }, null, 2) }] };
   }
-  await transport.handlePostMessage(req, res);
-});
+);
 
-app.get("/health", (_req, res) => res.status(200).send("ok"));
+// 5) OpenPhone: get conversation by ID
+registerToolSafe(
+  server,
+  {
+    name: "openphone.getConversation",
+    description: "Get a conversation (thread) by ID.",
+    inputSchema: z.object({
+      conversationId: z.string().min(1),
+      limit: z.number().int().min(1).max(200).default(50),
+      cursor: z.string().optional()
+    })
+  },
+  async ({ input }) => {
+    requireKey();
+    const path = `/v1/conversations/${encodeURIComponent(input.conversationId)}`;
+    const { data, meta } = await http("GET", path, {
+      query: { limit: input.limit, cursor: input.cursor }
+    });
+    return { content: [{ type: "text", text: JSON.stringify({ meta, data }, null, 2) }] };
+  }
+);
 
-app.listen(PORT, () => {
-  console.log(`Listening on :${PORT}`);
-});
+// 6) OpenPhone: search contacts
+registerToolSafe(
+  server,
+  {
+    name: "openphone.searchContacts",
+    description: "Search contacts by free-text query (name, phone, email, etc.).",
+    inputSchema: z.object({
+      query: z.string().min(1),
+      limit: z.number().int().min(1).max(100).default(25),
+      cursor: z.string().optional()
+    })
+  },
+  async ({ input }) => {
+    requireKey();
+    const path = "/v1/contacts/search";
+    const { data, meta } = await http("GET", path, {
+      query: { q: input.query, limit: input.limit, cursor: input.cursor }
+    });
+    return { content: [{ type: "text", text: JSON.stringify({ meta, data }, null, 2) }] };
+  }
+);
+
+// 7) OpenPhone: get contact by ID
+registerToolSafe(
+  server,
+  {
+    name: "openphone.getContact",
+    description: "Get a contact by ID.",
+    inputSchema: z.object({
+      contactId: z.string().min(1)
+    })
+  },
+  async ({ input }) => {
+    requireKey();
+    const path = `/v1/contacts/${encodeURIComponent(input.contactId)}`;
+    const { data, meta } = await http("GET", path);
+    return { content: [{ type: "text", text: JSON.stringify({ meta, data }, null, 2) }] };
+  }
+);
+
+// 8) OpenPhone: raw request (advanced)
+// Use this to hit endpoints not wrapped above. Be careful with body/headers.
+registerToolSafe(
+  server,
+  {
+    name: "openphone.rawRequest",
+    description:
+      "Make a raw HTTP request to the OpenPhone API. Useful for endpoints not covered by other tools.",
+    inputSchema: z.object({
+      method: z.enum(["GET", "POST", "PUT", "PATCH", "DELETE"]).default("GET"),
+      path: z.string().min(1).describe("Path starting with /v1/... (or full URL)."),
+      query: z.record(z.any()).optional(),
+      body: z.record(z.any()).optional(),
+      headers: z.record(z.string()).optional()
+    })
+  },
+  async ({ input }) => {
+    requireKey();
+    const { data, meta } = await http(input.method, input.path, {
+      query: input.query,
+      body: input.body,
+      headers: input.headers
+    });
+    return { content: [{ type: "text", text: JSON.stringify({ meta, data }, null, 2) }] };
+  }
+);
+
+// ---------- Transport ----------
+const transport = new StdioServerTransport();
+await server.connect(transport);
+console.log("OpenPhone MCP server started (stdio).");
