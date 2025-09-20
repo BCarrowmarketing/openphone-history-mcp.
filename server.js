@@ -1021,6 +1021,14 @@ app.post("/messages", express.json({ limit: "2mb" }), async (req, res) => {
         id: request.id,
         result: initResponse
       });
+    } else if (request.method === "initialized") {
+      // Acknowledge initialization complete
+      console.log("Initialization complete notification received");
+      res.json({
+        jsonrpc: "2.0",
+        id: request.id,
+        result: {}
+      });
     } else if (request.method === "tools/list") {
       try {
         const handler = server.getRequestHandler(ListToolsRequestSchema);
