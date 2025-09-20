@@ -75,8 +75,13 @@ async function callOpenPhoneAPI(toolName, args) {
     throw new Error("OPENPHONE_API_KEY environment variable is required");
   }
 
+  // Validate API key format
+  if (!OPENPHONE_API_KEY.startsWith('op_')) {
+    throw new Error("Invalid OpenPhone API key format. Must start with 'op_'");
+  }
+
   const headers = {
-    'Authorization': `Bearer ${OPENPHONE_API_KEY}`,
+    'Authorization': OPENPHONE_API_KEY,
     'Content-Type': 'application/json'
   };
 
@@ -165,7 +170,13 @@ function baseUrl(req) {
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, MCP-Session-Id');
+  
+  // CRITICAL: Add MCP protocol headers required by Claude
+  res.header('MCP-Protocol-Version', '2025-06-18');
+  if (req.headers['mcp-session-id']) {
+    res.header('MCP-Session-Id', req.headers['mcp-session-id']);
+  }
   
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
@@ -286,12 +297,23 @@ app.post("/messages", express.json({ limit: "2mb" }), async (req, res) => {
   }
 });
 
-// Health check
-app.get("/healthz", (_req, res) => res.json({ ok: true }));
+// Health check for Railway
+app.get("/healthz", (_req, res) => res.json({ 
+  ok: true, 
+  timestamp: new Date().toISOString(),
+  uptime: process.uptime(),
+  version: "1.0.0"
+}));
+
+// Additional health endpoint Railway sometimes uses
+app.get("/health", (_req, res) => res.json({ 
+  status: "healthy", 
+  timestamp: new Date().toISOString() 
+}));
 
 const PORT = Number(process.env.PORT || 8080);
-app.listen(PORT, () => {
-  console.log(`OpenPhone MCP Server listening on :${PORT}`);
-  console.log(`SSE endpoint: http://localhost:${PORT}/sse`);
-  console.log(`Messages endpoint: http://localhost:${PORT}/messages`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`OpenPhone MCP Server listening on 0.0.0.0:${PORT}`);
+  console.log(`SSE endpoint: https://openphone-history-mcp-production.up.railway.app/sse`);
+  console.log(`Messages endpoint: https://openphone-history-mcp-production.up.railway.app/messages`);
 });
